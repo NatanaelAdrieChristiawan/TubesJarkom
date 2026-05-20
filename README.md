@@ -255,6 +255,48 @@ Throughput = 3566.81 kbps
 
 ---
 
+## Panduan Diagnostik & Solusi Masalah Jaringan (WiFi)
+
+Jika laptop Proxy atau Client gagal terhubung ke Web Server meskipun sudah menggunakan WiFi yang sama, ikuti langkah diagnostik berikut:
+
+### 1. Masalah Terbesar: AP Isolation (Isolasi Klien)
+Banyak router WiFi (terutama WiFi Kampus, Kost, atau Kafe) mengaktifkan fitur **AP Isolation**. Fitur ini memblokir komunikasi antar perangkat yang terhubung ke router yang sama.
+
+* **Cara Test:** Buka Terminal/CMD di laptop Proxy, lakukan ping ke IP Web Server:
+  ```bash
+  ping <IP_WEB_SERVER>
+  # Contoh: ping 192.168.1.101
+  ```
+* **Solusi:** Jika hasilnya *Timed Out*, gunakan **Hotspot Tethering HP** salah satu anggota. Hubungkan semua laptop ke hotspot tersebut, lalu perbarui IP masing-masing.
+
+### 2. Ubah Profil WiFi ke Private (Khusus Windows)
+Windows secara default mengatur WiFi baru ke profil *Public* yang memblokir semua port koneksi masuk.
+* **Solusi:** Klik ikon WiFi -> **Properties** -> Ubah Network Profile dari **Public** ke **Private** agar Windows Defender mengizinkan lalu lintas data lokal.
+
+### 3. Tes Port Menggunakan Netcat / PowerShell
+Untuk memastikan port server terbuka dan bisa dijangkau:
+* **macOS/Linux (di laptop Proxy):**
+  ```bash
+  nc -zv <IP_WEB_SERVER> 8000
+  # Harus mengembalikan status: Connection to ... port 8000 [tcp] succeeded!
+  ```
+* **Windows PowerShell (di laptop Proxy):**
+  ```powershell
+  Test-NetConnection -ComputerName <IP_WEB_SERVER> -Port 8000
+  # Pastikan TcpTestSucceeded: True
+  ```
+
+### 4. Ganti Port jika Terjadi Konflik (Address already in use)
+Jika port `8080` (proxy) atau `8000` (web server) sudah dipakai oleh aplikasi lain:
+* Cari dan matikan aplikasi tersebut:
+  ```bash
+  # macOS/Linux
+  lsof -ti:8080,8000 | xargs kill -9
+  ```
+* Atau ubah variabel port di file kode (`webserver.py` atau `proxy.py`) ke port alternatif seperti `8082`, `8888`, atau `9999`.
+
+---
+
 ## Referensi
 
 1. Python `socket` — https://docs.python.org/3/library/socket.html
