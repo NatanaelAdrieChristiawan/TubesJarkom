@@ -1,168 +1,114 @@
+# proxy_v2.py
 import socket
 import threading
-import os
 import time
-from datetime import datetime
 
-PROXY_HOST = '0.0.0.0'
+PROXY_HOST = '0.0.0.0' # Portable: Mendengarkan semua interface lokal
 PROXY_PORT = 8080
-SERVER_HOST = '127.0.0.1'
-SERVER_PORT = 8000
-CACHE_DIR = './cache'
-FORWARD_TIMEOUT = 5
-BUFFER_SIZE = 4096
+WEB_SERVER_HOST = '127.0.0.1' # IP default Web Server tujuan
+WEB_SERVER_PORT = 8000
 
+# Manajemen Cache Thread-Safe dengan TTL Expiration
+cache = {} # Key: path, Value: {"data": bytes, "expiry": timestamp}
 cache_lock = threading.Lock()
+CACHE_TTL = 15 # Waktu kedaluwarsa cache (15 detik)
 
-ERROR_PAGES_DIR = './HTML/status'
-
-
-def log(message):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    thread_name = threading.current_thread().name
-    print(f'[{timestamp}] [{thread_name}] {message}')
-
-
-def get_cache_path(url_path):
-    safe = url_path.lstrip('/') or 'index.html'
-    return os.path.join(CACHE_DIR, safe)
-
-
-def read_cache(cache_path):
-    if os.path.isfile(cache_path):
-        with open(cache_path, 'rb') as f:
-            return f.read()
-    return None
-
-
-def save_cache(cache_path, data):
-    with cache_lock:
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, 'wb') as f:
-            f.write(data)
-
-
-def load_error_page(status_code):
-    error_file = os.path.join(ERROR_PAGES_DIR, f'{status_code}.html')
-    if os.path.isfile(error_file):
-        with open(error_file, 'rb') as f:
-            return f.read()
-    return f'<h1>{status_code}</h1>'.encode()
-
-
-def build_error_response(status_code, status_text):
-    body = load_error_page(status_code)
-    header = (
-        f'HTTP/1.1 {status_code} {status_text}\r\n'
-        f'Content-Type: text/html; charset=utf-8\r\n'
-        f'Content-Length: {len(body)}\r\n'
-        f'\r\n'
-    )
-    return header.encode() + body
-
-
-def forward_to_server(request_data):
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.settimeout(FORWARD_TIMEOUT)
+def handle_client(client_socket, client_addr):
     try:
-        server_sock.connect((SERVER_HOST, SERVER_PORT))
-        server_sock.sendall(request_data)
-
-        chunks = []
-        while True:
-            chunk = server_sock.recv(BUFFER_SIZE)
+        # Membaca request header secara aman hingga delimiter baris ganda
+        request_data = b""
+        while b"\r\n\r\n" not in request_data:
+            chunk = client_socket.recv(1024)
             if not chunk:
                 break
-            chunks.append(chunk)
-
-        return b''.join(chunks)
-    finally:
-        server_sock.close()
-
-
-def extract_status_code(response_data):
-    try:
-        status_line = response_data.split(b'\r\n')[0].decode()
-        return int(status_line.split()[1])
-    except (IndexError, ValueError):
-        return 0
-
-
-def handle_client(conn, addr):
-    try:
-        raw_request = conn.recv(BUFFER_SIZE)
-        if not raw_request:
+            request_data += chunk
+            
+        if not request_data:
+            return
+            
+        request_string = request_data.decode('utf-8', errors='ignore')
+        lines = request_string.split("\r\n")
+        if len(lines) == 0 or len(lines[0].split()) < 2:
+            return
+            
+        first_line = lines[0].split()
+        method = first_line[0]
+        path = first_line[1]
+        
+        if method != "GET":
+            # Menolak metode selain GET secara elegan
+            err_response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+            client_socket.sendall(err_response.encode())
             return
 
-        request_text = raw_request.decode('utf-8', errors='replace')
-        request_line = request_text.split('\r\n')[0]
-        parts = request_line.split()
+        # --- EVALUASI MEKANISME CACHE ---
+        current_time = time.time()
+        with cache_lock:
+            if path in cache and current_time < cache[path]["expiry"]:
+                print(f"[CACHE HIT] Melayani {path} langsung dari memori lokal Proxy.")
+                client_socket.sendall(cache[path]["data"])
+                return
 
-        if len(parts) < 2:
-            conn.sendall(build_error_response(400, 'Bad Request'))
-            return
-
-        url_path = parts[1]
-        if url_path == '/':
-            url_path = '/index.html'
-
-        cache_path = get_cache_path(url_path)
-        start_time = time.time()
-
-        cached_data = read_cache(cache_path)
-        if cached_data is not None:
-            conn.sendall(cached_data)
-            elapsed = (time.time() - start_time) * 1000
-            log(f'{addr[0]}:{addr[1]} {url_path} HIT {elapsed:.1f}ms')
-            return
-
+        print(f"[CACHE MISS] Meminta {path} dari Web Server utama.")
+        
+        # --- HUBUNGKAN KE WEB SERVER UTAMA ---
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.settimeout(3.0) # Batas tunggu koneksi ke server backend
         try:
-            response_data = forward_to_server(raw_request)
-        except socket.timeout:
-            conn.sendall(build_error_response(504, 'Gateway Timeout'))
-            elapsed = (time.time() - start_time) * 1000
-            log(f'{addr[0]}:{addr[1]} {url_path} TIMEOUT {elapsed:.1f}ms')
-            return
-        except (ConnectionRefusedError, OSError):
-            conn.sendall(build_error_response(504, 'Gateway Timeout'))
-            elapsed = (time.time() - start_time) * 1000
-            log(f'{addr[0]}:{addr[1]} {url_path} SERVER_UNREACHABLE {elapsed:.1f}ms')
-            return
-
-        status_code = extract_status_code(response_data)
-        if status_code >= 500:
-            conn.sendall(build_error_response(502, 'Bad Gateway'))
-            elapsed = (time.time() - start_time) * 1000
-            log(f'{addr[0]}:{addr[1]} {url_path} BAD_GATEWAY {elapsed:.1f}ms')
-            return
-
-        if status_code == 200:
-            save_cache(cache_path, response_data)
-
-        conn.sendall(response_data)
-        elapsed = (time.time() - start_time) * 1000
-        log(f'{addr[0]}:{addr[1]} {url_path} MISS {elapsed:.1f}ms')
-
+            server_socket.connect((WEB_SERVER_HOST, WEB_SERVER_PORT))
+            server_socket.sendall(request_data) # Meneruskan request client asli
+            
+            # Membaca seluruh response balik dari server utama
+            server_response = b""
+            while True:
+                response_chunk = server_socket.recv(4096)
+                if not response_chunk:
+                    break
+                server_response += response_chunk
+                
+            # Simpan data respons valid ke dalam tabel cache global
+            if b"200 OK" in server_response:
+                with cache_lock:
+                    cache[path] = {
+                        "data": server_response,
+                        "expiry": time.time() + CACHE_TTL
+                    }
+                    print(f"[*] Berhasil memperbarui Cache untuk path: {path}")
+            
+            # Kirim balik respons web server ke klien asal
+            client_socket.sendall(server_response)
+        except (ConnectionRefusedError, socket.timeout):
+            # Penanganan Graceful Error 502/504 menggantikan crash server
+            print(f"[!] Gagal terhubung ke Web Server. Mengirimkan 502 Bad Gateway.")
+            body = "<html><body><h1>502 Bad Gateway</h1><p>Web Server utama tidak terjangkau.</p></body></html>"
+            gateway_err = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+            client_socket.sendall(gateway_err.encode())
+        finally:
+            server_socket.close()
+            
     except Exception as e:
-        log(f'{addr[0]}:{addr[1]} Error: {e}')
+        print(f"[!] Internal Proxy Error: {e}")
     finally:
-        conn.close()
+        client_socket.close()
 
-
-if __name__ == '__main__':
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((PROXY_HOST, PROXY_PORT))
-    s.listen(10)
-
-    log(f'Proxy listening on port {PROXY_PORT} -> forwarding to {SERVER_HOST}:{SERVER_PORT}')
-
+def main():
+    proxy_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    proxy_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Anti port-locking
     try:
+        proxy_server.bind((PROXY_HOST, PROXY_PORT))
+        proxy_server.listen(10)
+        print(f"[*] Proxy Server aktif dan mendengarkan di http://localhost:{PROXY_PORT}")
+        
         while True:
-            conn, addr = s.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
-    except KeyboardInterrupt:
-        log('Proxy shutting down')
+            client_sock, client_addr = proxy_server.accept()
+            # Multithreading per koneksi masuk berjalan secara konkuren
+            thread = threading.Thread(target=handle_client, args=(client_sock, client_addr))
+            thread.daemon = True
+            thread.start()
+    except Exception as e:
+        print(f"[!] Gagal memulai Proxy: {e}")
+    finally:
+        proxy_server.close()
+
+if __name__ == "__main__":
+    main()

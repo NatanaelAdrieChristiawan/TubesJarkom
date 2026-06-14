@@ -1,138 +1,138 @@
+# webserver_v2.py
+import os
 import socket
 import threading
-import os
 import time
 from datetime import datetime
 
 SERVER_HOST = '0.0.0.0'
 TCP_PORT = 8000
 UDP_PORT = 9000
-WWW_DIR = './HTML'
+BASE_DIR = os.path.abspath("html") # Menentukan root direktori web secara absolut
 
-CONTENT_TYPES = {
-    '.html': 'text/html; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.js': 'application/javascript; charset=utf-8',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.gif': 'image/gif',
-    '.mp4': 'video/mp4',
-    '.txt': 'text/plain; charset=utf-8',
-    '.ico': 'image/x-icon',
-}
+def get_content_type(filepath):
+    """Menentukan ekstensi konten HTTP secara dinamis sesuai standar browser"""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.html': return 'text/html'
+    if ext == '.css': return 'text/css'
+    if ext == '.js': return 'application/javascript'
+    if ext == '.png': return 'image/png'
+    if ext == '.jpg' or ext == '.jpeg': return 'image/jpeg'
+    return 'application/octet-stream'
 
-
-def log(protocol, message):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f'[{timestamp}] [{protocol}] {message}')
-
-
-def get_content_type(path):
-    ext = os.path.splitext(path)[1].lower()
-    return CONTENT_TYPES.get(ext, 'application/octet-stream')
-
-
-def build_response(status_code, status_text, body=b'', content_type='text/html; charset=utf-8'):
-    header = (
-        f'HTTP/1.1 {status_code} {status_text}\r\n'
-        f'Content-Type: {content_type}\r\n'
-        f'Content-Length: {len(body)}\r\n'
-        f'\r\n'
-    )
-    return header.encode() + body
-
-
-def load_error_page(status_code):
-    error_file = os.path.join(WWW_DIR, 'status', f'{status_code}.html')
-    if os.path.isfile(error_file):
-        with open(error_file, 'rb') as f:
-            return f.read()
-    return f'<h1>{status_code}</h1>'.encode()
-
-
-def handle_tcp_client(conn, addr):
+def handle_tcp_client(connection_socket, client_addr):
     try:
-        raw_request = conn.recv(4096).decode('utf-8', errors='replace')
-        if not raw_request:
+        # Pembacaan request non-blocking yang aman
+        request_data = connection_socket.recv(2048)
+        if not request_data:
+            return
+            
+        request_string = request_data.decode('utf-8', errors='ignore')
+        lines = request_string.split("\r\n")
+        if len(lines) == 0 or len(lines[0].split()) < 2:
+            return
+            
+        first_line = lines[0].split()
+        method = first_line[0]
+        url_path = first_line[1]
+        
+        if url_path == "/" or url_path == "":
+            url_path = "/index.html"
+            
+        # --- PERBAIKAN SECURITY: PROTEKSI PATH TRAVERSAL ---
+        # Membersihkan path dan merakit ke lokasi absolut direktori html
+        target_path = os.path.abspath(os.path.join(BASE_DIR, url_path.lstrip("/")))
+        
+        # Cetak log aktivitas server sesuai spesifikasi dokumen TUBES
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] TCP Request dari {client_addr[0]} -> {method} {url_path}")
+        
+        # Validasi apakah folder tujuan berada di bawah kendali direktori BASE_DIR
+        if not target_path.startswith(BASE_DIR):
+            body = "<html><body><h1>403 Forbidden</h1><p>Akses ditolak.</p></body></html>"
+            response = f"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+            connection_socket.sendall(response.encode())
             return
 
-        request_line = raw_request.split('\r\n')[0]
-        parts = request_line.split()
-        if len(parts) < 2 or parts[0] != 'GET':
-            body = load_error_page(500)
-            response = build_response(400, 'Bad Request', body)
-            conn.sendall(response)
-            log('TCP', f'{addr[0]}:{addr[1]} {request_line} -> 400 Bad Request')
-            return
-
-        path = parts[1]
-        if path == '/':
-            path = '/index.html'
-
-        safe_path = os.path.normpath(path).lstrip('/')
-        file_path = os.path.join(WWW_DIR, safe_path)
-
-        if not os.path.isfile(file_path):
-            body = load_error_page(404)
-            response = build_response(404, 'Not Found', body)
-            conn.sendall(response)
-            log('TCP', f'{addr[0]}:{addr[1]} GET {path} -> 404 Not Found')
-            return
-
+        # --- PROSES UNTUK MEMBACA ASSET FILE ---
         try:
-            with open(file_path, 'rb') as f:
-                body = f.read()
-            content_type = get_content_type(file_path)
-            response = build_response(200, 'OK', body, content_type)
-            conn.sendall(response)
-            log('TCP', f'{addr[0]}:{addr[1]} GET {path} -> 200 OK')
-        except Exception as e:
-            body = load_error_page(500)
-            response = build_response(500, 'Internal Server Error', body)
-            conn.sendall(response)
-            log('TCP', f'{addr[0]}:{addr[1]} GET {path} -> 500 Internal Server Error ({e})')
-
+            # Membaca file dengan mode biner universal (rb) untuk menjamin file gambar aman
+            with open(target_path, 'rb') as f:
+                content = f.read()
+                
+            content_type = get_content_type(target_path)
+            header = f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n"
+            
+            # Kirim header teks dan biner body secara utuh
+            connection_socket.sendall(header.encode() + content)
+            
+        except FileNotFoundError:
+            body = "<html><body><h1>410 Not Found</h1><p>Halaman praktikum tidak ditemukan.</p></body></html>"
+            response = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+            connection_socket.sendall(response.encode())
+            
     except Exception as e:
-        log('TCP', f'{addr[0]}:{addr[1]} Connection error: {e}')
+        # Proteksi Error 500: Menjaga server tetap hidup jika terjadi kegagalan tidak terduga
+        body = "<html><body><h1>500 Internal Server Error</h1></body></html>"
+        err_res = f"HTTP/1.1 500 Internal Server Error\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+        try: connection_socket.sendall(err_res.encode()) 
+        except: pass
     finally:
-        conn.close()
+        connection_socket.close()
 
-
-def run_tcp_server():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((SERVER_HOST, TCP_PORT))
-    s.listen(10)
-    log('TCP', f'HTTP Server running on port {TCP_PORT}')
-
+def start_tcp_server():
+    """Mengelola lalu lintas web HTTP berbasis koneksi TCP"""
+    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_socket.bind((SERVER_HOST, TCP_PORT))
+    tcp_socket.listen(15)
+    print(f"[*] Web Server TCP aktif mendengarkan di port {TCP_PORT}")
+    
     while True:
-        conn, addr = s.accept()
-        t = threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True)
+        conn, addr = tcp_socket.accept()
+        t = threading.Thread(target=handle_tcp_client, args=(conn, addr))
+        t.daemon = True
         t.start()
 
-
-def run_udp_server():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((SERVER_HOST, UDP_PORT))
-    log('UDP', f'Echo server running on port {UDP_PORT}')
-
+def start_udp_echo_server():
+    """Mengelola pemantulan paket pinger berbasis komunikasi UDP"""
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.bind((SERVER_HOST, UDP_PORT))
+    print(f"[*] UDP Echo Server aktif mendengarkan di port {UDP_PORT}")
+    
     while True:
-        data, addr = s.recvfrom(4096)
-        s.sendto(data, addr)
-        log('UDP', f'Echo {len(data)} bytes to {addr[0]}:{addr[1]}')
+        try:
+            data, client_addr = udp_socket.recvfrom(2048)
+            # Menampilkan log kedatangan pinger di konsol server
+            # Format pesan pinger: "Ping <seq> <timestamp>"
+            msg = data.decode('utf-8', errors='ignore')
+            print(f"[QoS Log] Menerima UDP echo dari {client_addr}: {msg}")
+            
+            # Pantulkan kembali pesan secara instan tanpa modifikasi
+            udp_socket.sendto(data, client_addr)
+        except Exception as e:
+            print(f"[!] UDP Server Error: {e}")
 
-
-if __name__ == '__main__':
-    os.makedirs(WWW_DIR, exist_ok=True)
-
-    threading.Thread(target=run_tcp_server, daemon=True).start()
-    threading.Thread(target=run_udp_server, daemon=True).start()
-
-    log('MAIN', f'Web Server started (TCP:{TCP_PORT}, UDP:{UDP_PORT})')
-    log('MAIN', f'Serving files from: {os.path.abspath(WWW_DIR)}')
-
+if __name__ == "__main__":
+    # Menjamin pembuatan direktori placeholder html untuk kemudahan pengujian pertama
+    if not os.path.exists("html"):
+        os.makedirs("html")
+        with open("html/index.html", "w") as f:
+            f.write("<html><body><h1>Selamat Datang di Laboratorium Informatika</h1></body></html>")
+            
+    # Menjalankan Server TCP dan Server UDP secara simultan menggunakan multi-threading induk
+    tcp_thread = threading.Thread(target=start_tcp_server)
+    udp_thread = threading.Thread(target=start_udp_echo_server)
+    
+    tcp_thread.daemon = True
+    udp_thread.daemon = True
+    
+    tcp_thread.start()
+    udp_thread.start()
+    
+    # Menjaga thread utama tetap hidup mengawal kedua layanan background
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log('MAIN', 'Server shutting down')
+        print("\n[*] Mematikan seluruh layanan Web Server. Selesai.")

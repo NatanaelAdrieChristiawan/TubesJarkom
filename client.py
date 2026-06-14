@@ -1,142 +1,98 @@
+# client_v2.py
 import socket
+import sys
 import time
-import statistics
-import argparse
 
-
-def tcp_request(proxy_host, proxy_port, url_path):
-    request = (
-        f'GET {url_path} HTTP/1.1\r\n'
-        f'Host: {proxy_host}\r\n'
-        f'\r\n'
-    ).encode()
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5)
-
+def run_http_mode(proxy_host, proxy_port, path):
+    """Mode HTTP (TCP): Mengirim permintaan halaman web melalui Proxy Server"""
+    print(f"[*] Menjalankan Mode HTTP - Menghubungi Proxy di {proxy_host}:{proxy_port}")
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        start = time.time()
-        s.connect((proxy_host, proxy_port))
-        s.sendall(request)
-
-        chunks = []
+        client_socket.connect((proxy_host, proxy_port))
+        # Merakit request HTTP GET sesuai standar RFC
+        request = f"GET {path} HTTP/1.1\r\nHost: {proxy_host}\r\nConnection: close\r\n\r\n"
+        client_socket.sendall(request.encode('utf-8'))
+        
+        # Menerima seluruh response stream secara dinamis
+        response = b""
         while True:
-            chunk = s.recv(4096)
+            chunk = client_socket.recv(4096)
             if not chunk:
                 break
-            chunks.append(chunk)
-
-        elapsed = (time.time() - start) * 1000
-        response = b''.join(chunks)
-
-        header_end = response.find(b'\r\n\r\n')
-        if header_end == -1:
-            print('Error: Malformed response (no header boundary)')
-            return
-
-        header_part = response[:header_end].decode('utf-8', errors='replace')
-        body_part = response[header_end + 4:]
-
-        print(f'--- Response from {proxy_host}:{proxy_port} ---')
-        print(f'URL: {url_path}')
-        print(f'Time: {elapsed:.2f} ms')
-        print(f'--- Headers ---')
-        print(header_part)
-        print(f'--- Body ({len(body_part)} bytes) ---')
-        print(body_part.decode('utf-8', errors='replace'))
-
-    except socket.timeout:
-        print(f'Error: Connection timed out to {proxy_host}:{proxy_port}')
-    except ConnectionRefusedError:
-        print(f'Error: Connection refused by {proxy_host}:{proxy_port}')
+            response += chunk
+            
+        print("\n========== RESPONS DARI PROXY ==========")
+        print(response.decode('utf-8', errors='replace'))
+        print("========================================")
     except Exception as e:
-        print(f'Error: {e}')
+        print(f"[!] Error Koneksi HTTP: {e}")
     finally:
-        s.close()
+        client_socket.close()
 
-
-def udp_ping(target, port, count):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)
-
+def run_qos_mode(server_host, server_port):
+    """Mode QoS (UDP): Mengukur parameter performa jaringan (RTT, Loss, Jitter)"""
+    print(f"[*] Menjalankan Mode QoS UDP - Target Server: {server_host}:{server_port}")
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client_socket.settimeout(1.0) # Proteksi anti-freeze jika paket loss
+    
     rtts = []
-    total_bytes_sent = 0
-    total_bytes_received = 0
-    test_start = time.time()
-
-    print(f'Pinging {target}:{port} with {count} packets...\n')
-
-    for seq in range(1, count + 1):
-        payload = f'Ping {seq} {time.time()}'.encode()
-        total_bytes_sent += len(payload)
-        t_send = time.time()
-
-        s.sendto(payload, (target, port))
-
+    packets_sent = 10
+    packets_received = 0
+    
+    for seq in range(1, packets_sent + 1):
+        timestamp_send = time.time()
+        # Format string spesifik sesuai instruksi Soal TUBES
+        message = f"Ping {seq} {timestamp_send}"
         try:
-            data, _ = s.recvfrom(4096)
-            rtt = (time.time() - t_send) * 1000
-            total_bytes_received += len(data)
+            client_socket.sendto(message.encode('utf-8'), (server_host, server_port))
+            data, _ = client_socket.recvfrom(2048)
+            timestamp_recv = time.time()
+            
+            rtt = (timestamp_recv - timestamp_send) * 1000 # Mengubah ke milidetik (ms)
             rtts.append(rtt)
-            print(f'Ping {seq}: RTT = {rtt:.2f} ms')
+            packets_received += 1
+            print(f"Reply dari {server_host}: bytes={len(data)} seq={seq} RTT={rtt:.2f} ms")
         except socket.timeout:
-            print(f'Ping {seq}: Request timed out')
-
-    s.close()
-    test_duration = time.time() - test_start
-
-    sent = count
-    received = len(rtts)
-    lost = sent - received
-    loss_pct = (lost / sent) * 100
-
-    print(f'\n--- QoS Statistics ---')
-    print(f'Packets: {sent} sent, {received} received, {lost} lost ({loss_pct:.1f}%)')
-
-    if rtts:
-        rtt_min = min(rtts)
-        rtt_avg = sum(rtts) / len(rtts)
-        rtt_max = max(rtts)
-        print(f'RTT min/avg/max = {rtt_min:.2f}/{rtt_avg:.2f}/{rtt_max:.2f} ms')
-
+            print(f"Request seq={seq} timed out (Batas waktu 1 detik terlampaui)")
+        
+        time.sleep(0.1) # Jeda pengiriman paket 100ms
+        
+    client_socket.close()
+    
+    # Menghitung Analisis Parameter Statistik QoS
+    print("\n================ STATISTIK QoS ================")
+    if packets_received > 0:
+        min_rtt = min(rtts)
+        max_rtt = max(rtts)
+        avg_rtt = sum(rtts) / packets_received
+        
+        # Menghitung Fluktuasi Latensi (Jitter) berturutan
+        jitter = 0
         if len(rtts) > 1:
-            diffs = [abs(rtts[i] - rtts[i - 1]) for i in range(1, len(rtts))]
-            jitter = statistics.mean(diffs)
-            print(f'Jitter = {jitter:.2f} ms')
-        else:
-            print('Jitter = N/A (need at least 2 successful pings)')
-
-        total_bits = (total_bytes_sent + total_bytes_received) * 8
-        throughput_kbps = (total_bits / test_duration) / 1000 if test_duration > 0 else 0
-        print(f'Throughput = {throughput_kbps:.2f} kbps')
+            diffs = [abs(rtts[i] - rtts[i-1]) for i in range(1, len(rtts))]
+            jitter = sum(diffs) / len(diffs)
+            
+        loss_pct = ((packets_sent - packets_received) / packets_sent) * 100
+        
+        print(f" Paket: Dikirim = {packets_sent}, Diterima = {packets_received}, Loss = {loss_pct:.1f}%")
+        print(f" Waktu Pulang-Pergi (RTT): Min = {min_rtt:.2f} ms, Max = {max_rtt:.2f} ms, Rata-rata = {avg_rtt:.2f} ms")
+        print(f" Jitter (Variasi Latensi): {jitter:.2f} ms")
     else:
-        print('No successful pings — cannot compute statistics')
+        print("[!] Semua paket hilang (Loss = 100%)")
+    print("===============================================")
 
-
-def main():
-    parser = argparse.ArgumentParser(description='Client for TCP HTTP and UDP QoS testing')
-
-    parser.add_argument('-mode', required=True, choices=['tcp', 'udp'],
-                        help='Operation mode: tcp (HTTP request) or udp (QoS ping)')
-    parser.add_argument('-url', default='/index.html',
-                        help='URL path for TCP mode (default: /index.html)')
-    parser.add_argument('-proxy', default='127.0.0.1',
-                        help='Proxy/target host address')
-    parser.add_argument('-target', default='127.0.0.1',
-                        help='Target host for UDP mode')
-    parser.add_argument('-port', type=int, default=8080,
-                        help='Port number (default: 8080 for TCP, 9000 for UDP)')
-    parser.add_argument('-count', type=int, default=10,
-                        help='Number of UDP ping packets (default: 10)')
-
-    args = parser.parse_args()
-
-    if args.mode == 'tcp':
-        tcp_request(args.proxy, args.port, args.url)
+if __name__ == "__main__":
+    # Parsing argumen CLI secara aman dan intuitif tanpa dependensi eksternal
+    if len(sys.argv) < 3:
+        print("Penggunaan:")
+        print("  Mode HTTP: python client_v2.py -http [IP_Proxy] [Port_Proxy] [Path_File]")
+        print("  Mode QoS : python client_v2.py -qos [IP_Server] [Port_Server]")
+        sys.exit(1)
+        
+    mode = sys.argv[1]
+    if mode == "-http" and len(sys.argv) >= 5:
+        run_http_mode(sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    elif mode == "-qos" and len(sys.argv) >= 4:
+        run_qos_mode(sys.argv[2], int(sys.argv[3]))
     else:
-        port = args.port if args.port != 8080 else 9000
-        udp_ping(args.target, port, args.count)
-
-
-if __name__ == '__main__':
-    main()
+        print("[!] Argumen tidak valid.")
